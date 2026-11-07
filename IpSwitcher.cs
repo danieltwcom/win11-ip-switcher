@@ -28,6 +28,7 @@ namespace Win11IpSwitcher
         public string Gateway { get; set; }
         public string PrimaryDns { get; set; }
         public string SecondaryDns { get; set; }
+        public bool? AutoStart { get; set; }
 
         public AppConfig()
         {
@@ -37,6 +38,7 @@ namespace Win11IpSwitcher
             Gateway = "";
             PrimaryDns = "";
             SecondaryDns = "";
+            AutoStart = true;
         }
 
         public static AppConfig Load(string path)
@@ -64,6 +66,10 @@ namespace Win11IpSwitcher
                 cfg.Gateway = (cfg.Gateway ?? "").Trim();
                 cfg.PrimaryDns = (cfg.PrimaryDns ?? "").Trim();
                 cfg.SecondaryDns = (cfg.SecondaryDns ?? "").Trim();
+                if (!cfg.AutoStart.HasValue)
+                {
+                    cfg.AutoStart = true;
+                }
                 return cfg;
             }
             catch
@@ -81,7 +87,8 @@ namespace Win11IpSwitcher
                 SubnetMask = string.IsNullOrWhiteSpace(SubnetMask) ? "255.255.255.0" : SubnetMask.Trim(),
                 Gateway = (Gateway ?? "").Trim(),
                 PrimaryDns = (PrimaryDns ?? "").Trim(),
-                SecondaryDns = (SecondaryDns ?? "").Trim()
+                SecondaryDns = (SecondaryDns ?? "").Trim(),
+                AutoStart = AutoStart ?? true
             };
             var serializer = new JavaScriptSerializer();
             string json = serializer.Serialize(normalized);
@@ -249,59 +256,36 @@ namespace Win11IpSwitcher
 
         [DllImport("user32.dll", ExactSpelling = true)]
         public static extern bool DestroyIcon(IntPtr hIcon);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool DeleteFileW(string lpFileName);
     }
 
     public static class AutoStartHelper
     {
-        public const string TaskName = "Win11IpSwitcher_AutoStart";
         public const string RunRegKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
         public const string RunRegValueName = "Win11IpSwitcher";
 
-        public static string BuildTaskCommand(string exePath)
+        public static string BuildRunRegistryValue(string exePath)
         {
             return string.Format("\"{0}\" --tray", (exePath ?? "").Trim());
         }
 
-        public static string BuildSchtasksCreateArgs(string exePath)
+        public static void TryRemoveZoneIdentifier(string filePath)
         {
-            string tr = BuildTaskCommand(exePath).Replace("\"", "\\\"");
-            return string.Format("/Create /TN \"{0}\" /TR \"{1}\" /SC ONLOGON /RL HIGHEST /F", TaskName, tr);
-        }
-
-        public static string BuildSchtasksDeleteArgs()
-        {
-            return string.Format("/Delete /TN \"{0}\" /F", TaskName);
-        }
-
-        public static string BuildSchtasksQueryArgs()
-        {
-            return string.Format("/Query /TN \"{0}\"", TaskName);
-        }
-
-        public static bool IsAutoStartEnabled()
-        {
+            if (string.IsNullOrWhiteSpace(filePath))
+                return;
             try
             {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "schtasks.exe",
-                    Arguments = BuildSchtasksQueryArgs(),
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true
-                };
-                using (Process p = Process.Start(psi))
-                {
-                    p.WaitForExit(3000);
-                    if (p.ExitCode == 0)
-                        return true;
-                }
+                NativeMethods.DeleteFileW(filePath + ":Zone.Identifier");
             }
             catch
             {
             }
+        }
 
+        public static bool IsAutoStartEnabled()
+        {
             try
             {
                 using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunRegKeyPath, false))
@@ -322,60 +306,22 @@ namespace Win11IpSwitcher
         public static bool SetAutoStart(bool enable, string exePath, out string message)
         {
             message = "";
+            TryRemoveZoneIdentifier(exePath);
+
             if (enable)
             {
-                // 1. Try creating a highest-privilege logon scheduled task so UAC won't prompt on boot
-                try
-                {
-                    var psi = new ProcessStartInfo
-                    {
-                        FileName = "schtasks.exe",
-                        Arguments = BuildSchtasksCreateArgs(exePath),
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true
-                    };
-                    using (Process p = Process.Start(psi))
-                    {
-                        string stdOut = p.StandardOutput.ReadToEnd();
-                        string stdErr = p.StandardError.ReadToEnd();
-                        p.WaitForExit(5000);
-                        if (p.ExitCode == 0)
-                        {
-                            // Clean up fallback registry key if any
-                            try
-                            {
-                                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunRegKeyPath, true))
-                                {
-                                    if (key != null && key.GetValue(RunRegValueName) != null)
-                                        key.DeleteValue(RunRegValueName, false);
-                                }
-                            }
-                            catch { }
-                            message = "已开启开机自启动（登录时静默进入系统托盘）。";
-                            return true;
-                        }
-                        message = (stdOut + " " + stdErr).Trim();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    message = ex.Message;
-                }
-
-                // 2. Fallback to HKCU\...\Run if not elevated when toggling checkbox
                 try
                 {
                     using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunRegKeyPath, true))
                     {
                         if (key != null)
                         {
-                            key.SetValue(RunRegValueName, BuildTaskCommand(exePath), RegistryValueKind.String);
-                            message = "已开启开机自启动（当前未提权，使用注册表启动项）。";
+                            key.SetValue(RunRegValueName, BuildRunRegistryValue(exePath), RegistryValueKind.String);
+                            message = "已开启开机自启动（登录时静默驻留系统托盘）。";
                             return true;
                         }
                     }
+                    message = "无法打开当前用户启动项注册表。";
                 }
                 catch (Exception ex)
                 {
@@ -385,27 +331,6 @@ namespace Win11IpSwitcher
             }
             else
             {
-                bool ok = true;
-                try
-                {
-                    var psi = new ProcessStartInfo
-                    {
-                        FileName = "schtasks.exe",
-                        Arguments = BuildSchtasksDeleteArgs(),
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true
-                    };
-                    using (Process p = Process.Start(psi))
-                    {
-                        p.WaitForExit(5000);
-                    }
-                }
-                catch
-                {
-                }
-
                 try
                 {
                     using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunRegKeyPath, true))
@@ -415,20 +340,14 @@ namespace Win11IpSwitcher
                             key.DeleteValue(RunRegValueName, false);
                         }
                     }
+                    message = "已关闭开机自动启动。";
+                    return true;
                 }
                 catch (Exception ex)
                 {
                     message = ex.Message;
-                    ok = false;
-                }
-
-                if (IsAutoStartEnabled())
-                {
-                    message = "取消开机自启动需要管理员权限。";
                     return false;
                 }
-                message = "已关闭开机自动启动。";
-                return ok;
             }
         }
     }
@@ -1625,17 +1544,43 @@ namespace Win11IpSwitcher
         private bool _hasShownTrayBalloon;
         private EventWaitHandle _showWindowEvent;
         private Thread _ipcThread;
+        private readonly string _initialAction;
 
-        public MainForm(string configPath, bool startInTray = false, EventWaitHandle showWindowEvent = null)
+        public MainForm(string configPath, bool startInTray = false, EventWaitHandle showWindowEvent = null, string initialAction = null)
         {
             _configPath = configPath;
             _startInTray = startInTray;
             _showWindowEvent = showWindowEvent;
+            _initialAction = initialAction;
             _config = AppConfig.Load(_configPath);
             InitializeLayout();
             InitializeTray();
             LoadAdaptersAndConfig();
             StartSingleInstanceListener();
+
+            if (!string.IsNullOrWhiteSpace(_initialAction) && IsHandleCreated)
+            {
+                ScheduleInitialAction();
+            }
+            else if (!string.IsNullOrWhiteSpace(_initialAction))
+            {
+                HandleCreated += (s, e) => ScheduleInitialAction();
+            }
+        }
+
+        private void ScheduleInitialAction()
+        {
+            BeginInvoke(new Action(() =>
+            {
+                if (_initialAction == "--do-dhcp")
+                {
+                    OnSwitchToDhcpClicked(_startInTray);
+                }
+                else if (_initialAction == "--do-static")
+                {
+                    OnSwitchToStaticClicked(_startInTray);
+                }
+            }));
         }
 
         public bool StartInTray
@@ -1713,7 +1658,8 @@ namespace Win11IpSwitcher
                 SubnetMask = _txtMask.Text.Trim(),
                 Gateway = _txtGateway.Text.Trim(),
                 PrimaryDns = _txtDns1.Text.Trim(),
-                SecondaryDns = _txtDns2.Text.Trim()
+                SecondaryDns = _txtDns2.Text.Trim(),
+                AutoStart = _chkAutoStart != null ? _chkAutoStart.Checked : (_config.AutoStart ?? true)
             };
         }
 
@@ -2065,7 +2011,14 @@ namespace Win11IpSwitcher
             _suppressAutoStartEvent = true;
             try
             {
-                bool enabled = AutoStartHelper.IsAutoStartEnabled();
+                bool shouldEnable = _config != null ? (_config.AutoStart ?? true) : true;
+                if (shouldEnable)
+                {
+                    string ignoreMsg;
+                    AutoStartHelper.SetAutoStart(true, Application.ExecutablePath, out ignoreMsg);
+                }
+
+                bool enabled = shouldEnable ? true : AutoStartHelper.IsAutoStartEnabled();
                 _chkAutoStart.Checked = enabled;
                 if (_menuItemAutoStart != null)
                 {
@@ -2096,6 +2049,9 @@ namespace Win11IpSwitcher
                 }
                 return;
             }
+
+            _config.AutoStart = target;
+            _config.Save(_configPath);
 
             if (_menuItemAutoStart != null)
             {
@@ -2300,7 +2256,7 @@ namespace Win11IpSwitcher
             _config.AdapterName = adapterName;
             _config.Save(_configPath);
 
-            if (!EnsureAdminOrRestart())
+            if (!EnsureAdminOrRestart(fromTray, "--do-dhcp"))
                 return;
 
             SetButtonsEnabled(false);
@@ -2349,7 +2305,7 @@ namespace Win11IpSwitcher
             cfg.Save(_configPath);
             _config = cfg;
 
-            if (!EnsureAdminOrRestart())
+            if (!EnsureAdminOrRestart(fromTray, "--do-static"))
                 return;
 
             SetButtonsEnabled(false);
@@ -2382,24 +2338,19 @@ namespace Win11IpSwitcher
             }
         }
 
-        private bool EnsureAdminOrRestart()
+        private bool EnsureAdminOrRestart(bool fromTray, string actionFlag)
         {
             if (NetworkHelper.IsAdministrator())
                 return true;
 
-            DialogResult dr = MessageBox.Show(
-                this,
-                "修改 Windows 11 网卡属性需要管理员权限。\r\n是否立即以管理员身份重新启动本程序？（已填写的参数已自动保存）",
-                "需要管理员权限",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question);
-
-            if (dr == DialogResult.Yes)
+            Program.ReleaseCurrentMutex();
+            if (Program.TryRelaunchAsAdmin(fromTray, actionFlag))
             {
-                if (Program.TryRelaunchAsAdmin(false))
-                {
-                    QuitApplication();
-                }
+                QuitApplication();
+            }
+            else
+            {
+                Program.ReacquireCurrentMutex();
             }
             return false;
         }
@@ -2522,8 +2473,8 @@ namespace Win11IpSwitcher
                 Assert(staticBlob[156] == 24, "Static blob prefix length mismatch");
 
                 // 7. System Tray & AutoStart helper checks
-                string createArgs = AutoStartHelper.BuildSchtasksCreateArgs(@"C:\Tools\IpSwitcher.exe");
-                Assert(createArgs.Contains("Win11IpSwitcher_AutoStart") && createArgs.Contains("--tray") && createArgs.Contains("/RL HIGHEST"), "AutoStart schtasks args mismatch: " + createArgs);
+                string runRegVal = AutoStartHelper.BuildRunRegistryValue(@"C:\Tools\IpSwitcher.exe");
+                Assert(runRegVal == "\"C:\\Tools\\IpSwitcher.exe\" --tray", "AutoStart Run registry value mismatch: " + runRegVal);
                 using (Icon dhcpIcon = TrayIconFactory.CreateModeIcon(true))
                 using (Icon staticIcon = TrayIconFactory.CreateModeIcon(false))
                 {
@@ -2585,7 +2536,7 @@ namespace Win11IpSwitcher
                     Assert(collected.IpAddress == "192.168.50.88", "Form should load seeded IP");
                     Assert(collected.Gateway == "192.168.50.1", "Form should load seeded Gateway");
                     Assert(form.TrayNotifyIcon != null && form.TrayNotifyIcon.ContextMenuStrip != null, "Tray icon and context menu should be initialized");
-                    Assert(form.AutoStartCheckBox != null, "Auto-start checkbox should be initialized");
+                    Assert(form.AutoStartCheckBox != null && form.AutoStartCheckBox.Checked, "Auto-start checkbox should be initialized and checked by default");
 
                     form.SetFormFields("192.168.50.99", "255.255.255.0", "192.168.50.1", "223.5.5.5", "");
                     form.SaveCurrentFormToConfig();
@@ -2617,15 +2568,48 @@ namespace Win11IpSwitcher
     {
         private const string SingleInstanceMutexName = @"Local\Win11IpSwitcher_SingleInstance_Mutex";
         private const string ShowWindowEventName = @"Local\Win11IpSwitcher_ShowWindow_Event";
+        private static Mutex _activeMutex;
 
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
 
-        public static bool TryRelaunchAsAdmin(bool startInTray)
+        public static void ReleaseCurrentMutex()
+        {
+            try
+            {
+                if (_activeMutex != null)
+                {
+                    _activeMutex.ReleaseMutex();
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        public static void ReacquireCurrentMutex()
+        {
+            try
+            {
+                if (_activeMutex != null)
+                {
+                    _activeMutex.WaitOne(1000);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        public static bool TryRelaunchAsAdmin(bool startInTray, string actionFlag = null)
         {
             try
             {
                 string extra = startInTray ? " --tray" : "";
+                if (!string.IsNullOrWhiteSpace(actionFlag))
+                {
+                    extra += " " + actionFlag;
+                }
                 var psi = new ProcessStartInfo
                 {
                     FileName = Application.ExecutablePath,
@@ -2650,6 +2634,8 @@ namespace Win11IpSwitcher
             {
                 return SelfTestRunner.Run();
             }
+
+            AutoStartHelper.TryRemoveZoneIdentifier(Application.ExecutablePath);
 
             try
             {
@@ -2687,12 +2673,19 @@ namespace Win11IpSwitcher
 
             bool startInTray = args != null && args.Contains("--tray");
             bool skipAutoElevate = args != null && (args.Contains("--no-elevate") || args.Contains("--elevated-attempt"));
+            string initialAction = null;
+            if (args != null)
+            {
+                if (args.Contains("--do-dhcp")) initialAction = "--do-dhcp";
+                else if (args.Contains("--do-static")) initialAction = "--do-static";
+            }
 
             // Check if an instance is already running before requesting elevation
             EventWaitHandle showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowWindowEventName);
             bool createdNew;
             using (Mutex singleMutex = new Mutex(true, SingleInstanceMutexName, out createdNew))
             {
+                _activeMutex = singleMutex;
                 if (!createdNew)
                 {
                     // Another instance is already running in tray/window: wake it up and exit
@@ -2700,20 +2693,22 @@ namespace Win11IpSwitcher
                     return 0;
                 }
 
-                if (!NetworkHelper.IsAdministrator() && !skipAutoElevate)
+                // When started silently at boot via HKCU\...\Run (--tray), do NOT prompt UAC on boot;
+                // elevate on demand only when the user clicks to switch IP mode.
+                if (!startInTray && !NetworkHelper.IsAdministrator() && !skipAutoElevate)
                 {
                     // Release mutex before relaunching elevated child so child can acquire it
-                    singleMutex.ReleaseMutex();
-                    if (TryRelaunchAsAdmin(startInTray))
+                    ReleaseCurrentMutex();
+                    if (TryRelaunchAsAdmin(startInTray, initialAction))
                     {
                         return 0;
                     }
                     // If user canceled UAC, re-acquire mutex and continue in preview mode
-                    singleMutex.WaitOne();
+                    ReacquireCurrentMutex();
                 }
 
                 string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
-                Application.Run(new MainForm(configPath, startInTray, showEvent));
+                Application.Run(new MainForm(configPath, startInTray, showEvent, initialAction));
                 GC.KeepAlive(singleMutex);
             }
             return 0;
