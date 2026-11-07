@@ -1,0 +1,14 @@
+# Compiled binaries
+*.exe
+*.pdb
+*.dll
+
+# Runtime configuration & logs
+config.json
+*.log
+
+# Legacy prototype & local scratch notes
+IPSwitcher.ps1
+Run-IPSwitcher.bat
+create-pr.ps1
+docs/
