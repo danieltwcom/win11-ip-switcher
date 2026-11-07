@@ -28,6 +28,7 @@ namespace Win11IpSwitcher
         public string Gateway { get; set; }
         public string PrimaryDns { get; set; }
         public string SecondaryDns { get; set; }
+        public bool? AutoStart { get; set; }
 
         public AppConfig()
         {
@@ -37,6 +38,7 @@ namespace Win11IpSwitcher
             Gateway = "";
             PrimaryDns = "";
             SecondaryDns = "";
+            AutoStart = true;
         }
 
         public static AppConfig Load(string path)
@@ -64,6 +66,10 @@ namespace Win11IpSwitcher
                 cfg.Gateway = (cfg.Gateway ?? "").Trim();
                 cfg.PrimaryDns = (cfg.PrimaryDns ?? "").Trim();
                 cfg.SecondaryDns = (cfg.SecondaryDns ?? "").Trim();
+                if (!cfg.AutoStart.HasValue)
+                {
+                    cfg.AutoStart = true;
+                }
                 return cfg;
             }
             catch
@@ -81,7 +87,8 @@ namespace Win11IpSwitcher
                 SubnetMask = string.IsNullOrWhiteSpace(SubnetMask) ? "255.255.255.0" : SubnetMask.Trim(),
                 Gateway = (Gateway ?? "").Trim(),
                 PrimaryDns = (PrimaryDns ?? "").Trim(),
-                SecondaryDns = (SecondaryDns ?? "").Trim()
+                SecondaryDns = (SecondaryDns ?? "").Trim(),
+                AutoStart = AutoStart ?? true
             };
             var serializer = new JavaScriptSerializer();
             string json = serializer.Serialize(normalized);
@@ -1651,7 +1658,8 @@ namespace Win11IpSwitcher
                 SubnetMask = _txtMask.Text.Trim(),
                 Gateway = _txtGateway.Text.Trim(),
                 PrimaryDns = _txtDns1.Text.Trim(),
-                SecondaryDns = _txtDns2.Text.Trim()
+                SecondaryDns = _txtDns2.Text.Trim(),
+                AutoStart = _chkAutoStart != null ? _chkAutoStart.Checked : (_config.AutoStart ?? true)
             };
         }
 
@@ -2003,7 +2011,14 @@ namespace Win11IpSwitcher
             _suppressAutoStartEvent = true;
             try
             {
-                bool enabled = AutoStartHelper.IsAutoStartEnabled();
+                bool shouldEnable = _config != null ? (_config.AutoStart ?? true) : true;
+                if (shouldEnable)
+                {
+                    string ignoreMsg;
+                    AutoStartHelper.SetAutoStart(true, Application.ExecutablePath, out ignoreMsg);
+                }
+
+                bool enabled = shouldEnable ? true : AutoStartHelper.IsAutoStartEnabled();
                 _chkAutoStart.Checked = enabled;
                 if (_menuItemAutoStart != null)
                 {
@@ -2034,6 +2049,9 @@ namespace Win11IpSwitcher
                 }
                 return;
             }
+
+            _config.AutoStart = target;
+            _config.Save(_configPath);
 
             if (_menuItemAutoStart != null)
             {
@@ -2518,7 +2536,7 @@ namespace Win11IpSwitcher
                     Assert(collected.IpAddress == "192.168.50.88", "Form should load seeded IP");
                     Assert(collected.Gateway == "192.168.50.1", "Form should load seeded Gateway");
                     Assert(form.TrayNotifyIcon != null && form.TrayNotifyIcon.ContextMenuStrip != null, "Tray icon and context menu should be initialized");
-                    Assert(form.AutoStartCheckBox != null, "Auto-start checkbox should be initialized");
+                    Assert(form.AutoStartCheckBox != null && form.AutoStartCheckBox.Checked, "Auto-start checkbox should be initialized and checked by default");
 
                     form.SetFormFields("192.168.50.99", "255.255.255.0", "192.168.50.1", "223.5.5.5", "");
                     form.SaveCurrentFormToConfig();
