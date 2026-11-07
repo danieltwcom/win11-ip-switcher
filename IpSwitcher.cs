@@ -1544,39 +1544,54 @@ namespace Win11IpSwitcher
         private bool _hasShownTrayBalloon;
         private EventWaitHandle _showWindowEvent;
         private Thread _ipcThread;
-        private readonly string _initialAction;
+        private string _pendingInitialAction;
+        private bool _suppressInitialShow;
 
         public MainForm(string configPath, bool startInTray = false, EventWaitHandle showWindowEvent = null, string initialAction = null)
         {
             _configPath = configPath;
             _startInTray = startInTray;
+            _suppressInitialShow = startInTray;
             _showWindowEvent = showWindowEvent;
-            _initialAction = initialAction;
+            _pendingInitialAction = initialAction;
             _config = AppConfig.Load(_configPath);
             InitializeLayout();
             InitializeTray();
             LoadAdaptersAndConfig();
             StartSingleInstanceListener();
 
-            if (!string.IsNullOrWhiteSpace(_initialAction) && IsHandleCreated)
+            if (!string.IsNullOrWhiteSpace(_pendingInitialAction))
             {
-                ScheduleInitialAction();
-            }
-            else if (!string.IsNullOrWhiteSpace(_initialAction))
-            {
-                HandleCreated += (s, e) => ScheduleInitialAction();
+                if (IsHandleCreated)
+                {
+                    ScheduleInitialAction();
+                }
+                else
+                {
+                    EventHandler onHandleCreated = null;
+                    onHandleCreated = (s, e) =>
+                    {
+                        HandleCreated -= onHandleCreated;
+                        ScheduleInitialAction();
+                    };
+                    HandleCreated += onHandleCreated;
+                }
             }
         }
 
         private void ScheduleInitialAction()
         {
+            string actionToRun = Interlocked.Exchange(ref _pendingInitialAction, null);
+            if (string.IsNullOrWhiteSpace(actionToRun))
+                return;
+
             BeginInvoke(new Action(() =>
             {
-                if (_initialAction == "--do-dhcp")
+                if (actionToRun == "--do-dhcp")
                 {
                     OnSwitchToDhcpClicked(_startInTray);
                 }
-                else if (_initialAction == "--do-static")
+                else if (actionToRun == "--do-static")
                 {
                     OnSwitchToStaticClicked(_startInTray);
                 }
@@ -1586,6 +1601,11 @@ namespace Win11IpSwitcher
         public bool StartInTray
         {
             get { return _startInTray; }
+        }
+
+        public string PendingInitialAction
+        {
+            get { return _pendingInitialAction; }
         }
 
         public NotifyIcon TrayNotifyIcon
@@ -1600,9 +1620,9 @@ namespace Win11IpSwitcher
 
         protected override void SetVisibleCore(bool value)
         {
-            if (_startInTray && !IsHandleCreated && value)
+            if (_suppressInitialShow && value)
             {
-                ShowInTaskbar = false;
+                _suppressInitialShow = false;
                 base.SetVisibleCore(false);
                 var handle = Handle; // Ensure HWND is created so IPC Invoke works while hidden
                 return;
@@ -1925,7 +1945,6 @@ namespace Win11IpSwitcher
 
         public void HideToTray(bool showFirstTimeBalloon)
         {
-            ShowInTaskbar = false;
             Hide();
             if (showFirstTimeBalloon && !_hasShownTrayBalloon && _notifyIcon != null)
             {
@@ -1941,7 +1960,6 @@ namespace Win11IpSwitcher
         public void RestoreFromTray()
         {
             RefreshAdapterList();
-            ShowInTaskbar = true;
             Show();
             if (WindowState == FormWindowState.Minimized)
             {
@@ -2538,13 +2556,23 @@ namespace Win11IpSwitcher
                     Assert(form.TrayNotifyIcon != null && form.TrayNotifyIcon.ContextMenuStrip != null, "Tray icon and context menu should be initialized");
                     Assert(form.AutoStartCheckBox != null && form.AutoStartCheckBox.Checked, "Auto-start checkbox should be initialized and checked by default");
 
+                    IntPtr initialHandle = form.Handle;
+                    int handleCreatedCount = 0;
+                    form.HandleCreated += (s, e) => handleCreatedCount++;
+                    form.HideToTray(false);
+                    form.RestoreFromTray();
+                    form.HideToTray(false);
+                    Assert(form.Handle == initialHandle && handleCreatedCount == 0, "HideToTray/RestoreFromTray must not recreate HWND or re-fire HandleCreated");
+
                     form.SetFormFields("192.168.50.99", "255.255.255.0", "192.168.50.1", "223.5.5.5", "");
                     form.SaveCurrentFormToConfig();
                 }
 
-                using (var trayForm = new MainForm(tempFile, true, null))
+                using (var trayForm = new MainForm(tempFile, true, null, "--noop-action"))
                 {
                     Assert(trayForm.StartInTray, "Tray form should record startInTray=true");
+                    var h = trayForm.Handle;
+                    Assert(trayForm.PendingInitialAction == null, "PendingInitialAction must be consumed once on HandleCreated and cleared to null");
                 }
 
                 AppConfig afterSave = AppConfig.Load(tempFile);
