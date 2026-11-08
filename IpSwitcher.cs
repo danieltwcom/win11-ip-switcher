@@ -257,6 +257,18 @@ namespace Win11IpSwitcher
         [DllImport("user32.dll", ExactSpelling = true)]
         public static extern bool DestroyIcon(IntPtr hIcon);
 
+        [DllImport("user32.dll")]
+        public static extern uint GetDpiForWindow(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        public static extern uint GetDpiForSystem();
+
+        [DllImport("user32.dll")]
+        public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+        [DllImport("shcore.dll")]
+        public static extern int SetProcessDpiAwareness(int value);
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern bool DeleteFileW(string lpFileName);
     }
@@ -1510,18 +1522,24 @@ namespace Win11IpSwitcher
         private AppConfig _config;
         private List<AdapterStatus> _adapters = new List<AdapterStatus>();
 
+        private Label _lblAdapter;
         private ComboBox _cmbAdapters;
         private Button _btnRefresh;
+        private GroupBox _grpCurrent;
         private Label _lblModeBadge;
         private Label _lblCurrentDetails;
         private Button _btnCopyCurrent;
 
+        private GroupBox _grpStatic;
+        private Label[] _fieldLabels;
+        private TextBox[] _fieldTextBoxes;
         private TextBox _txtIp;
         private TextBox _txtMask;
         private TextBox _txtGateway;
         private TextBox _txtDns1;
         private TextBox _txtDns2;
         private Button _btnSaveOnly;
+        private Label _lblHint;
 
         private CheckBox _chkAutoStart;
         private bool _suppressAutoStartEvent;
@@ -1529,6 +1547,16 @@ namespace Win11IpSwitcher
         private Button _btnSwitchDhcp;
         private Button _btnSwitchStatic;
         private Label _lblStatusMessage;
+
+        private float _dpiScale = 1.0f;
+        private bool _inLayout;
+        private Font _fontRegular;
+        private Font _fontBold;
+        private Font _fontHint;
+        private Font _fontButton;
+        private Font _fontTrayRegular;
+        private Font _fontTrayBold;
+        private ToolTip _toolTip;
 
         private NotifyIcon _notifyIcon;
         private ContextMenuStrip _trayMenu;
@@ -1618,6 +1646,21 @@ namespace Win11IpSwitcher
             get { return _chkAutoStart; }
         }
 
+        public float CurrentDpiScale
+        {
+            get { return _dpiScale; }
+        }
+
+        public GroupBox CurrentStatusGroup
+        {
+            get { return _grpCurrent; }
+        }
+
+        public GroupBox StaticConfigGroup
+        {
+            get { return _grpStatic; }
+        }
+
         protected override void SetVisibleCore(bool value)
         {
             if (_suppressInitialShow && value)
@@ -1698,34 +1741,85 @@ namespace Win11IpSwitcher
             _config.Save(_configPath);
         }
 
+        private int S(int logicalPixels)
+        {
+            return (int)Math.Round(logicalPixels * _dpiScale);
+        }
+
+        private static Font CreateScaledFont(float basePointSize, FontStyle style, float scale)
+        {
+            float pixelHeight = Math.Max(10f, basePointSize * (96f / 72f) * scale);
+            return new Font("Microsoft YaHei UI", pixelHeight, style, GraphicsUnit.Pixel);
+        }
+
+        public float GetSystemOrWindowDpiScale()
+        {
+            try
+            {
+                if (IsHandleCreated)
+                {
+                    uint wndDpi = NativeMethods.GetDpiForWindow(Handle);
+                    if (wndDpi >= 72 && wndDpi <= 480)
+                    {
+                        return wndDpi / 96f;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                uint sysDpi = NativeMethods.GetDpiForSystem();
+                if (sysDpi >= 72 && sysDpi <= 480)
+                {
+                    return sysDpi / 96f;
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+                {
+                    if (g.DpiX >= 72f && g.DpiX <= 480f)
+                    {
+                        return g.DpiX / 96f;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return 1.0f;
+        }
+
         private void InitializeLayout()
         {
             bool isAdmin = NetworkHelper.IsAdministrator();
+            AutoScaleMode = AutoScaleMode.None;
             Text = "Windows 11 网络 DHCP / 静态 IP 一键切换" + (isAdmin ? " (管理员)" : " (未提权 - 仅预览)");
-            Size = new Size(520, 555);
-            FormBorderStyle = FormBorderStyle.FixedSingle;
+            FormBorderStyle = FormBorderStyle.Sizable;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular);
             BackColor = Color.FromArgb(248, 249, 250);
-
-            int padX = 20;
-            int contentWidth = 465;
+            _toolTip = new ToolTip();
 
             // 1. Adapter selection row
-            var lblAdapter = new Label
+            _lblAdapter = new Label
             {
                 Text = "目标网卡：",
-                Location = new Point(padX, 18),
-                Size = new Size(75, 24),
+                AutoSize = false,
                 TextAlign = ContentAlignment.MiddleLeft
             };
-            Controls.Add(lblAdapter);
+            Controls.Add(_lblAdapter);
 
             _cmbAdapters = new ComboBox
             {
-                Location = new Point(padX + 78, 15),
-                Size = new Size(305, 28),
                 DropDownStyle = ComboBoxStyle.DropDownList
             };
             _cmbAdapters.SelectedIndexChanged += (s, e) => UpdateCurrentAdapterStatusView();
@@ -1734,9 +1828,8 @@ namespace Win11IpSwitcher
             _btnRefresh = new Button
             {
                 Text = "刷新",
-                Location = new Point(padX + 390, 14),
-                Size = new Size(75, 28),
-                FlatStyle = FlatStyle.System
+                FlatStyle = FlatStyle.Standard,
+                UseVisualStyleBackColor = true
             };
             _btnRefresh.Click += (s, e) =>
             {
@@ -1746,84 +1839,75 @@ namespace Win11IpSwitcher
             Controls.Add(_btnRefresh);
 
             // 2. Current status card
-            var grpCurrent = new GroupBox
+            _grpCurrent = new GroupBox
             {
-                Text = "当前实时网络状态",
-                Location = new Point(padX, 52),
-                Size = new Size(contentWidth, 118)
+                Text = "当前实时网络状态"
             };
 
             _lblModeBadge = new Label
             {
                 Text = "● 正在读取状态...",
-                Location = new Point(15, 24),
-                Size = new Size(300, 22),
-                Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold)
+                AutoSize = false,
+                TextAlign = ContentAlignment.MiddleLeft
             };
-            grpCurrent.Controls.Add(_lblModeBadge);
+            _grpCurrent.Controls.Add(_lblModeBadge);
 
             _btnCopyCurrent = new Button
             {
                 Text = "填入下方表单",
-                Location = new Point(345, 20),
-                Size = new Size(105, 26),
-                FlatStyle = FlatStyle.System
+                FlatStyle = FlatStyle.Standard,
+                UseVisualStyleBackColor = true
             };
             _btnCopyCurrent.Click += (s, e) => CopyCurrentAdapterToForm();
-            grpCurrent.Controls.Add(_btnCopyCurrent);
+            _grpCurrent.Controls.Add(_btnCopyCurrent);
 
             _lblCurrentDetails = new Label
             {
                 Text = "",
-                Location = new Point(15, 52),
-                Size = new Size(435, 56),
+                AutoSize = false,
                 ForeColor = Color.FromArgb(60, 64, 67)
             };
-            grpCurrent.Controls.Add(_lblCurrentDetails);
-            Controls.Add(grpCurrent);
+            _grpCurrent.Controls.Add(_lblCurrentDetails);
+            Controls.Add(_grpCurrent);
 
             // 3. Static IP preset group
-            var grpStatic = new GroupBox
+            _grpStatic = new GroupBox
             {
-                Text = "手动配置参数（自动保存，下次打开直接使用）",
-                Location = new Point(padX, 180),
-                Size = new Size(contentWidth, 215)
+                Text = "手动配置参数（自动保存，下次打开直接使用）"
             };
 
-            _txtIp = AddLabeledTextBox(grpStatic, "IPv4 地址：", 30, "例如 192.168.1.200");
-            _txtMask = AddLabeledTextBox(grpStatic, "子网掩码：", 62, "默认 255.255.255.0");
-            _txtGateway = AddLabeledTextBox(grpStatic, "默认网关：", 94, "选填，例如 192.168.1.1");
-            _txtDns1 = AddLabeledTextBox(grpStatic, "首选 DNS：", 126, "选填，例如 223.5.5.5");
-            _txtDns2 = AddLabeledTextBox(grpStatic, "备用 DNS：", 158, "选填，例如 8.8.8.8");
+            _fieldLabels = new Label[5];
+            _fieldTextBoxes = new TextBox[5];
+            _txtIp = AddLabeledTextBox(_grpStatic, 0, "IPv4 地址：", "例如 192.168.1.200");
+            _txtMask = AddLabeledTextBox(_grpStatic, 1, "子网掩码：", "默认 255.255.255.0");
+            _txtGateway = AddLabeledTextBox(_grpStatic, 2, "默认网关：", "选填，例如 192.168.1.1");
+            _txtDns1 = AddLabeledTextBox(_grpStatic, 3, "首选 DNS：", "选填，例如 223.5.5.5");
+            _txtDns2 = AddLabeledTextBox(_grpStatic, 4, "备用 DNS：", "选填，例如 8.8.8.8");
 
             _btnSaveOnly = new Button
             {
                 Text = "仅保存参数",
-                Location = new Point(345, 184),
-                Size = new Size(105, 25),
-                FlatStyle = FlatStyle.System
+                FlatStyle = FlatStyle.Standard,
+                UseVisualStyleBackColor = true
             };
             _btnSaveOnly.Click += (s, e) => OnSaveOnlyClicked();
-            grpStatic.Controls.Add(_btnSaveOnly);
+            _grpStatic.Controls.Add(_btnSaveOnly);
 
-            var lblHint = new Label
+            _lblHint = new Label
             {
                 Text = "提示：切换为手动时也会自动保存参数",
-                Location = new Point(15, 187),
-                Size = new Size(320, 20),
-                ForeColor = Color.Gray,
-                Font = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Regular)
+                AutoSize = false,
+                TextAlign = ContentAlignment.MiddleLeft,
+                ForeColor = Color.Gray
             };
-            grpStatic.Controls.Add(lblHint);
-
-            Controls.Add(grpStatic);
+            _grpStatic.Controls.Add(_lblHint);
+            Controls.Add(_grpStatic);
 
             // 4. Auto-start & tray option row
             _chkAutoStart = new CheckBox
             {
                 Text = "开机自动启动（开机后直接静默驻留右下角托盘，不弹窗口）",
-                Location = new Point(padX + 2, 403),
-                Size = new Size(460, 24),
+                AutoSize = false,
                 ForeColor = Color.FromArgb(45, 50, 55)
             };
             _chkAutoStart.CheckedChanged += (s, e) => OnAutoStartCheckedChanged();
@@ -1833,9 +1917,6 @@ namespace Win11IpSwitcher
             _btnSwitchDhcp = new Button
             {
                 Text = "切换为自动 (DHCP)",
-                Location = new Point(padX, 434),
-                Size = new Size(222, 42),
-                Font = new Font("Microsoft YaHei UI", 10.5f, FontStyle.Bold),
                 BackColor = Color.FromArgb(25, 135, 84),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
@@ -1848,9 +1929,6 @@ namespace Win11IpSwitcher
             _btnSwitchStatic = new Button
             {
                 Text = "切换为手动 (静态 IP)",
-                Location = new Point(padX + 243, 434),
-                Size = new Size(222, 42),
-                Font = new Font("Microsoft YaHei UI", 10.5f, FontStyle.Bold),
                 BackColor = Color.FromArgb(13, 110, 253),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
@@ -1866,12 +1944,318 @@ namespace Win11IpSwitcher
                 Text = isAdmin
                     ? "就绪：点击右上角 × 可隐藏到系统托盘，右键托盘图标可快速切换或退出。"
                     : "提示：当前未获取管理员权限，点击切换按钮时将请求管理员权限。",
-                Location = new Point(padX, 482),
-                Size = new Size(contentWidth, 24),
+                AutoSize = false,
                 TextAlign = ContentAlignment.MiddleLeft,
                 ForeColor = isAdmin ? Color.FromArgb(60, 64, 67) : Color.FromArgb(180, 80, 0)
             };
             Controls.Add(_lblStatusMessage);
+
+            ApplyDpiScale(GetSystemOrWindowDpiScale());
+        }
+
+        public void ApplyDpiScale(float scale)
+        {
+            if (scale < 0.75f) scale = 0.75f;
+            if (scale > 4.0f) scale = 4.0f;
+
+            _inLayout = true;
+            SuspendLayout();
+            _grpCurrent.SuspendLayout();
+            _grpStatic.SuspendLayout();
+            try
+            {
+                _dpiScale = scale;
+
+                Font oldRegular = _fontRegular;
+                Font oldBold = _fontBold;
+                Font oldHint = _fontHint;
+                Font oldButton = _fontButton;
+                Font oldTrayRegular = _fontTrayRegular;
+                Font oldTrayBold = _fontTrayBold;
+
+                _fontRegular = CreateScaledFont(9.5f, FontStyle.Regular, _dpiScale);
+                _fontBold = CreateScaledFont(10f, FontStyle.Bold, _dpiScale);
+                _fontHint = CreateScaledFont(8.5f, FontStyle.Regular, _dpiScale);
+                _fontButton = CreateScaledFont(10.5f, FontStyle.Bold, _dpiScale);
+                _fontTrayRegular = CreateScaledFont(9f, FontStyle.Regular, _dpiScale);
+                _fontTrayBold = CreateScaledFont(9f, FontStyle.Bold, _dpiScale);
+
+                Font = _fontRegular;
+                _lblAdapter.Font = _fontRegular;
+                _cmbAdapters.Font = _fontRegular;
+                _btnRefresh.Font = _fontRegular;
+                _grpCurrent.Font = _fontRegular;
+                _lblModeBadge.Font = _fontBold;
+                _btnCopyCurrent.Font = _fontRegular;
+                _lblCurrentDetails.Font = _fontRegular;
+                _grpStatic.Font = _fontRegular;
+                for (int i = 0; i < _fieldLabels.Length; i++)
+                {
+                    _fieldLabels[i].Font = _fontRegular;
+                    _fieldTextBoxes[i].Font = _fontRegular;
+                }
+                _btnSaveOnly.Font = _fontRegular;
+                _lblHint.Font = _fontHint;
+                _chkAutoStart.Font = _fontRegular;
+                _btnSwitchDhcp.Font = _fontButton;
+                _btnSwitchStatic.Font = _fontButton;
+                _lblStatusMessage.Font = _fontRegular;
+
+                if (_trayMenu != null) _trayMenu.Font = _fontTrayRegular;
+                if (_menuItemOpen != null) _menuItemOpen.Font = _fontTrayBold;
+
+                if (oldRegular != null) oldRegular.Dispose();
+                if (oldBold != null) oldBold.Dispose();
+                if (oldHint != null) oldHint.Dispose();
+                if (oldButton != null) oldButton.Dispose();
+                if (oldTrayRegular != null) oldTrayRegular.Dispose();
+                if (oldTrayBold != null) oldTrayBold.Dispose();
+
+                int targetClientWidth = CalculateTargetClientWidth();
+                int requiredClientHeight = PerformResponsiveLayout(targetClientWidth);
+                FitWindowToContentAndScreen(targetClientWidth, requiredClientHeight);
+                UpdateAdapterComboDropDownWidth();
+            }
+            finally
+            {
+                _grpStatic.ResumeLayout(false);
+                _grpCurrent.ResumeLayout(false);
+                ResumeLayout(false);
+                _inLayout = false;
+            }
+        }
+
+        private int CalculateTargetClientWidth()
+        {
+            int padX = S(20);
+            int chkWidth = TextRenderer.MeasureText(_chkAutoStart.Text, _fontRegular).Width + S(34);
+            int statusWidth = TextRenderer.MeasureText(_lblStatusMessage.Text, _fontRegular).Width + S(12);
+            int btn1Width = TextRenderer.MeasureText(_btnSwitchDhcp.Text, _fontButton).Width + S(36);
+            int btn2Width = TextRenderer.MeasureText(_btnSwitchStatic.Text, _fontButton).Width + S(36);
+            int buttonsRowWidth = Math.Max(btn1Width, btn2Width) * 2 + S(18);
+            int grpStaticTitleWidth = TextRenderer.MeasureText(_grpStatic.Text, _fontRegular).Width + S(36);
+
+            int minContentWidth = S(465);
+            if (chkWidth > minContentWidth) minContentWidth = chkWidth;
+            if (statusWidth > minContentWidth) minContentWidth = statusWidth;
+            if (buttonsRowWidth > minContentWidth) minContentWidth = buttonsRowWidth;
+            if (grpStaticTitleWidth > minContentWidth) minContentWidth = grpStaticTitleWidth;
+
+            return minContentWidth + padX * 2;
+        }
+
+        private int PerformResponsiveLayout(int clientWidth)
+        {
+            int padX = S(20);
+            int contentWidth = Math.Max(S(320), clientWidth - padX * 2);
+            int innerPadX = S(15);
+            int innerWidth = Math.Max(S(200), contentWidth - innerPadX * 2);
+
+            // 1. Adapter selection row
+            int top = S(16);
+            int lblAdapterW = Math.Max(S(75), TextRenderer.MeasureText(_lblAdapter.Text, _fontRegular).Width + S(6));
+            int btnRefreshW = Math.Max(S(75), TextRenderer.MeasureText(_btnRefresh.Text, _fontRegular).Width + S(24));
+            int cmbH = _cmbAdapters.PreferredHeight;
+            int row1H = Math.Max(cmbH, Math.Max(S(28), _fontRegular.Height + S(10)));
+
+            _lblAdapter.Bounds = new Rectangle(padX, top, lblAdapterW, row1H);
+            _btnRefresh.Bounds = new Rectangle(padX + contentWidth - btnRefreshW, top, btnRefreshW, row1H);
+            int cmbLeft = _lblAdapter.Right + S(6);
+            int cmbWidth = Math.Max(S(100), _btnRefresh.Left - S(8) - cmbLeft);
+            _cmbAdapters.Bounds = new Rectangle(cmbLeft, top + Math.Max(0, (row1H - cmbH) / 2), cmbWidth, cmbH);
+            int row1Bottom = Math.Max(_lblAdapter.Bottom, Math.Max(_cmbAdapters.Bottom, _btnRefresh.Bottom));
+
+            // 2. Current status card
+            int grpCurrentTop = row1Bottom + S(12);
+            int grpTopInset = Math.Max(S(22), _fontRegular.Height + S(8));
+            int btnCopyW = Math.Max(S(108), TextRenderer.MeasureText(_btnCopyCurrent.Text, _fontRegular).Width + S(24));
+            int btnCopyH = Math.Max(S(26), _fontRegular.Height + S(10));
+            int badgeH = Math.Max(btnCopyH, _fontBold.Height + S(6));
+            int headerRowH = Math.Max(btnCopyH, badgeH);
+
+            _btnCopyCurrent.Bounds = new Rectangle(
+                contentWidth - innerPadX - btnCopyW,
+                grpTopInset + (headerRowH - btnCopyH) / 2,
+                btnCopyW,
+                btnCopyH);
+            _lblModeBadge.Bounds = new Rectangle(
+                innerPadX,
+                grpTopInset + (headerRowH - badgeH) / 2,
+                Math.Max(S(100), _btnCopyCurrent.Left - S(10) - innerPadX),
+                badgeH);
+
+            int detailsTop = Math.Max(_lblModeBadge.Bottom, _btnCopyCurrent.Bottom) + S(8);
+            int detailsH = Math.Max(S(52), (_fontRegular.Height + S(6)) * 2 + S(8));
+            _lblCurrentDetails.Bounds = new Rectangle(innerPadX, detailsTop, innerWidth, detailsH);
+            int grpCurrentH = _lblCurrentDetails.Bottom + S(12);
+            _grpCurrent.Bounds = new Rectangle(padX, grpCurrentTop, contentWidth, grpCurrentH);
+
+            // 3. Static IP preset group
+            int grpStaticTop = _grpCurrent.Bottom + S(12);
+            int rowY = Math.Max(S(26), _fontRegular.Height + S(12));
+            int fieldLblW = S(90);
+            for (int i = 0; i < _fieldLabels.Length; i++)
+            {
+                int w = TextRenderer.MeasureText(_fieldLabels[i].Text, _fontRegular).Width + S(8);
+                if (w > fieldLblW) fieldLblW = w;
+            }
+
+            int txtLeft = innerPadX + fieldLblW + S(4);
+            int txtWidth = Math.Max(S(120), contentWidth - innerPadX - txtLeft);
+            int rowGap = S(8);
+            for (int i = 0; i < _fieldTextBoxes.Length; i++)
+            {
+                TextBox txt = _fieldTextBoxes[i];
+                Label lbl = _fieldLabels[i];
+                int txtH = Math.Max(txt.PreferredHeight, _fontRegular.Height + S(8));
+                txt.Location = new Point(txtLeft, rowY);
+                txt.Size = new Size(txtWidth, txtH);
+                lbl.Bounds = new Rectangle(innerPadX, rowY, fieldLblW, txt.Height);
+                rowY = txt.Bottom + rowGap;
+            }
+
+            int saveRowTop = rowY + S(2);
+            int btnSaveW = Math.Max(S(108), TextRenderer.MeasureText(_btnSaveOnly.Text, _fontRegular).Width + S(24));
+            int btnSaveH = Math.Max(S(26), _fontRegular.Height + S(10));
+            _btnSaveOnly.Bounds = new Rectangle(contentWidth - innerPadX - btnSaveW, saveRowTop, btnSaveW, btnSaveH);
+            _lblHint.Bounds = new Rectangle(
+                innerPadX,
+                saveRowTop,
+                Math.Max(S(100), _btnSaveOnly.Left - S(10) - innerPadX),
+                btnSaveH);
+            int grpStaticH = Math.Max(_btnSaveOnly.Bottom, _lblHint.Bottom) + S(12);
+            _grpStatic.Bounds = new Rectangle(padX, grpStaticTop, contentWidth, grpStaticH);
+
+            // 4. Auto-start & tray option row
+            int chkTop = _grpStatic.Bottom + S(10);
+            int chkH = Math.Max(S(24), _fontRegular.Height + S(8));
+            _chkAutoStart.Bounds = new Rectangle(padX + S(2), chkTop, contentWidth - S(2), chkH);
+
+            // 5. Two primary switch buttons
+            int btnSwitchTop = _chkAutoStart.Bottom + S(8);
+            int btnGap = S(18);
+            int btnSwitchW = (contentWidth - btnGap) / 2;
+            int btnSwitchH = Math.Max(S(42), _fontButton.Height + S(18));
+            _btnSwitchDhcp.Bounds = new Rectangle(padX, btnSwitchTop, btnSwitchW, btnSwitchH);
+            _btnSwitchStatic.Bounds = new Rectangle(padX + contentWidth - btnSwitchW, btnSwitchTop, btnSwitchW, btnSwitchH);
+
+            // 6. Status bar message
+            int statusTop = _btnSwitchDhcp.Bottom + S(8);
+            int statusH = Math.Max(S(26), _fontRegular.Height + S(8));
+            _lblStatusMessage.Bounds = new Rectangle(padX, statusTop, contentWidth, statusH);
+
+            return _lblStatusMessage.Bottom + S(12);
+        }
+
+        private void FitWindowToContentAndScreen(int targetClientWidth, int requiredClientHeight)
+        {
+            MinimumSize = Size.Empty;
+
+            Rectangle workingArea = Screen.PrimaryScreen != null
+                ? Screen.PrimaryScreen.WorkingArea
+                : new Rectangle(0, 0, 1920, 1080);
+            try
+            {
+                if (IsHandleCreated)
+                {
+                    workingArea = Screen.FromHandle(Handle).WorkingArea;
+                }
+            }
+            catch
+            {
+            }
+
+            Size frameBorder = Size - ClientSize;
+            int maxClientWidth = Math.Max(S(360), workingArea.Width - frameBorder.Width - S(16));
+            int maxClientHeight = Math.Max(S(320), workingArea.Height - frameBorder.Height - S(16));
+
+            bool needsScroll = targetClientWidth > maxClientWidth || requiredClientHeight > maxClientHeight;
+            int finalClientWidth = Math.Min(targetClientWidth, maxClientWidth);
+            int finalClientHeight = Math.Min(requiredClientHeight, maxClientHeight);
+
+            if (needsScroll)
+            {
+                AutoScroll = true;
+                AutoScrollMinSize = new Size(targetClientWidth, requiredClientHeight);
+            }
+            else
+            {
+                AutoScrollMinSize = Size.Empty;
+                AutoScroll = false;
+            }
+
+            ClientSize = new Size(finalClientWidth, finalClientHeight);
+            MinimumSize = new Size(
+                Math.Min(finalClientWidth + frameBorder.Width, workingArea.Width),
+                Math.Min(finalClientHeight + frameBorder.Height, workingArea.Height));
+        }
+
+        private void UpdateAdapterComboDropDownWidth()
+        {
+            if (_cmbAdapters == null || _fontRegular == null)
+                return;
+
+            int maxWidth = _cmbAdapters.Width;
+            for (int i = 0; i < _cmbAdapters.Items.Count; i++)
+            {
+                string itemText = _cmbAdapters.Items[i] != null ? _cmbAdapters.Items[i].ToString() : "";
+                int w = TextRenderer.MeasureText(itemText, _fontRegular).Width + S(28);
+                if (w > maxWidth)
+                {
+                    maxWidth = w;
+                }
+            }
+            if (maxWidth > 0)
+            {
+                _cmbAdapters.DropDownWidth = maxWidth;
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            float actualScale = GetSystemOrWindowDpiScale();
+            if (Math.Abs(actualScale - _dpiScale) > 0.01f)
+            {
+                ApplyDpiScale(actualScale);
+            }
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (!_inLayout && IsHandleCreated && WindowState != FormWindowState.Minimized && ClientSize.Width > 0)
+            {
+                _inLayout = true;
+                try
+                {
+                    int layoutWidth = AutoScroll && AutoScrollMinSize.Width > ClientSize.Width
+                        ? AutoScrollMinSize.Width
+                        : ClientSize.Width;
+                    PerformResponsiveLayout(layoutWidth);
+                    UpdateAdapterComboDropDownWidth();
+                }
+                finally
+                {
+                    _inLayout = false;
+                }
+            }
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            const int WM_DPICHANGED = 0x02E0;
+            if (m.Msg == WM_DPICHANGED)
+            {
+                int newDpi = (int)(m.WParam.ToInt64() & 0xFFFF);
+                if (newDpi >= 72 && newDpi <= 480)
+                {
+                    ApplyDpiScale(newDpi / 96f);
+                    m.Result = IntPtr.Zero;
+                    return;
+                }
+            }
+            base.WndProc(ref m);
         }
 
         private void InitializeTray()
@@ -1882,7 +2266,7 @@ namespace Win11IpSwitcher
 
             _trayMenu = new ContextMenuStrip
             {
-                Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular)
+                Font = _fontTrayRegular ?? CreateScaledFont(9f, FontStyle.Regular, _dpiScale)
             };
 
             _menuItemStatus = new ToolStripMenuItem("当前状态：正在读取...")
@@ -1910,7 +2294,7 @@ namespace Win11IpSwitcher
             _trayMenu.Items.Add(_menuItemAutoStart);
 
             _menuItemOpen = new ToolStripMenuItem("打开设置窗口...");
-            _menuItemOpen.Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold);
+            _menuItemOpen.Font = _fontTrayBold ?? CreateScaledFont(9f, FontStyle.Bold, _dpiScale);
             _menuItemOpen.Click += (s, e) => RestoreFromTray();
             _trayMenu.Items.Add(_menuItemOpen);
 
@@ -2020,6 +2404,17 @@ namespace Win11IpSwitcher
                     _iconStatic.Dispose();
                     _iconStatic = null;
                 }
+                if (_toolTip != null)
+                {
+                    _toolTip.Dispose();
+                    _toolTip = null;
+                }
+                if (_fontRegular != null) { _fontRegular.Dispose(); _fontRegular = null; }
+                if (_fontBold != null) { _fontBold.Dispose(); _fontBold = null; }
+                if (_fontHint != null) { _fontHint.Dispose(); _fontHint = null; }
+                if (_fontButton != null) { _fontButton.Dispose(); _fontButton = null; }
+                if (_fontTrayRegular != null) { _fontTrayRegular.Dispose(); _fontTrayRegular = null; }
+                if (_fontTrayBold != null) { _fontTrayBold.Dispose(); _fontTrayBold = null; }
             }
             base.Dispose(disposing);
         }
@@ -2078,25 +2473,24 @@ namespace Win11IpSwitcher
             SetStatusMessage("✓ " + msg, Color.FromArgb(25, 135, 84));
         }
 
-        private TextBox AddLabeledTextBox(Control parent, string labelText, int top, string tooltip)
+        private TextBox AddLabeledTextBox(Control parent, int index, string labelText, string tooltip)
         {
             var lbl = new Label
             {
                 Text = labelText,
-                Location = new Point(15, top + 3),
-                Size = new Size(90, 22),
+                AutoSize = false,
                 TextAlign = ContentAlignment.MiddleLeft
             };
             parent.Controls.Add(lbl);
 
-            var txt = new TextBox
+            var txt = new TextBox();
+            if (_toolTip != null)
             {
-                Location = new Point(110, top),
-                Size = new Size(340, 25)
-            };
-            var tip = new ToolTip();
-            tip.SetToolTip(txt, tooltip);
+                _toolTip.SetToolTip(txt, tooltip);
+            }
             parent.Controls.Add(txt);
+            _fieldLabels[index] = lbl;
+            _fieldTextBoxes[index] = txt;
             return txt;
         }
 
@@ -2120,6 +2514,8 @@ namespace Win11IpSwitcher
             {
                 _cmbAdapters.Items.Add(_adapters[i]);
             }
+
+            UpdateAdapterComboDropDownWidth();
 
             int selectedIdx = NetworkHelper.ChooseBestAdapterIndex(_adapters, preferredName, isStartupOrNoSelection);
 
@@ -2532,6 +2928,24 @@ namespace Win11IpSwitcher
             }
         }
 
+        private static void VerifyContainerNoOverlapAndInBounds(Control container, int maxRight, int maxBottom, string label)
+        {
+            for (int i = 0; i < container.Controls.Count; i++)
+            {
+                Control c1 = container.Controls[i];
+                Assert(c1.Left >= 0 && c1.Top >= 0, label + ": control '" + c1.Text + "' has negative coordinates: " + c1.Bounds);
+                Assert(c1.Right <= maxRight, label + ": control '" + c1.Text + "' right (" + c1.Right + ") exceeds container width (" + maxRight + ")");
+                Assert(c1.Bottom <= maxBottom, label + ": control '" + c1.Text + "' bottom (" + c1.Bottom + ") exceeds container height (" + maxBottom + ")");
+
+                for (int j = i + 1; j < container.Controls.Count; j++)
+                {
+                    Control c2 = container.Controls[j];
+                    Assert(!c1.Bounds.IntersectsWith(c2.Bounds),
+                        label + ": control '" + c1.Text + "' (" + c1.Bounds + ") overlaps with '" + c2.Text + "' (" + c2.Bounds + ")");
+                }
+            }
+        }
+
         public static int RunSmokeUi()
         {
             string tempFile = Path.Combine(Path.GetTempPath(), "ip_switcher_ui_" + Guid.NewGuid().ToString("N") + ".json");
@@ -2563,6 +2977,24 @@ namespace Win11IpSwitcher
                     form.RestoreFromTray();
                     form.HideToTray(false);
                     Assert(form.Handle == initialHandle && handleCreatedCount == 0, "HideToTray/RestoreFromTray must not recreate HWND or re-fire HandleCreated");
+
+                    // Verify DPI scaling layout across 100%, 125%, 150% (2K), 175%, 200% (4K), and 250%
+                    float[] testScales = new float[] { 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f };
+                    for (int sIdx = 0; sIdx < testScales.Length; sIdx++)
+                    {
+                        float scale = testScales[sIdx];
+                        form.ApplyDpiScale(scale);
+                        Assert(Math.Abs(form.CurrentDpiScale - scale) < 0.001f, "CurrentDpiScale should match applied scale " + scale);
+
+                        int effectiveFormWidth = Math.Max(form.ClientSize.Width, form.AutoScrollMinSize.Width);
+                        int effectiveFormHeight = Math.Max(form.ClientSize.Height, form.AutoScrollMinSize.Height);
+                        string scaleTag = "Scale " + scale.ToString("0.00", CultureInfo.InvariantCulture);
+
+                        VerifyContainerNoOverlapAndInBounds(form, effectiveFormWidth, effectiveFormHeight, scaleTag + " MainForm");
+                        VerifyContainerNoOverlapAndInBounds(form.CurrentStatusGroup, form.CurrentStatusGroup.ClientSize.Width, form.CurrentStatusGroup.ClientSize.Height, scaleTag + " CurrentStatusGroup");
+                        VerifyContainerNoOverlapAndInBounds(form.StaticConfigGroup, form.StaticConfigGroup.ClientSize.Width, form.StaticConfigGroup.ClientSize.Height, scaleTag + " StaticConfigGroup");
+                    }
+                    Assert(form.Handle == initialHandle && handleCreatedCount == 0, "ApplyDpiScale must not recreate HWND");
 
                     form.SetFormFields("192.168.50.99", "255.255.255.0", "192.168.50.1", "223.5.5.5", "");
                     form.SaveCurrentFormToConfig();
@@ -2600,6 +3032,41 @@ namespace Win11IpSwitcher
 
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
+
+        private static void EnableHighDpiSupport()
+        {
+            try
+            {
+                // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+                if (NativeMethods.SetProcessDpiAwarenessContext(new IntPtr(-4)))
+                {
+                    return;
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                // PROCESS_PER_MONITOR_DPI_AWARE = 2
+                if (NativeMethods.SetProcessDpiAwareness(2) == 0)
+                {
+                    return;
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                SetProcessDPIAware();
+            }
+            catch
+            {
+            }
+        }
 
         public static void ReleaseCurrentMutex()
         {
@@ -2665,13 +3132,7 @@ namespace Win11IpSwitcher
 
             AutoStartHelper.TryRemoveZoneIdentifier(Application.ExecutablePath);
 
-            try
-            {
-                SetProcessDPIAware();
-            }
-            catch
-            {
-            }
+            EnableHighDpiSupport();
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
